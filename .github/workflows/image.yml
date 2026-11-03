@@ -1,0 +1,117 @@
+name: Test, build and publish image
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+      - name: Validate production Compose interpolation
+        run: docker compose --env-file .env.example config --quiet
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: Determine the lowercase GHCR image name
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - name: Image tags and labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: ${{ steps.image.outputs.name }}
+          flavor: latest=false
+          tags: |
+            type=sha,format=long
+            type=semver,pattern={{version}}
+            type=raw,value=edge,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=Forever Healing
+            org.opencontainers.image.description=French interactive healer guide for WoW Forever
+      - name: Build the smoke-test image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          load: true
+          push: false
+          platforms: linux/amd64
+          tags: forever-healing:smoke
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          sbom: false
+          build-args: APP_VERSION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Test the production container
+        run: |
+          docker run --detach --name forever-healing-smoke \
+            --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+            --memory 256m --pids-limit 128 \
+            -p 127.0.0.1:3000:3000 forever-healing:smoke
+          node scripts/smoke.mjs
+          docker exec forever-healing-smoke node scripts/healthcheck.mjs
+          test "$(docker inspect --format '{{.Config.User}}' forever-healing-smoke)" = "node"
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs forever-healing-smoke || true
+      - name: Remove the test container
+        if: always()
+        run: docker rm --force forever-healing-smoke || true
+      - name: Sign in to GHCR
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the tested image without rebuilding
+        id: publish
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: node scripts/publish-image.mjs
+      - name: Record the immutable reference for manual deployment
+        if: steps.publish.outcome == 'success'
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          echo '### Image ready for manual deployment' >> "$GITHUB_STEP_SUMMARY"
+          echo "IMAGE_REF=${IMAGE}@${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+          echo 'No connection to the VPS and no automatic deployment.' >> "$GITHUB_STEP_SUMMARY"

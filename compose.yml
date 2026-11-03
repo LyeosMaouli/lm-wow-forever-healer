@@ -1,0 +1,38 @@
+name: forever-healing
+services:
+  web:
+    image: ${IMAGE_REF:?Set IMAGE_REF in .env to a published image or digest}
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "3000"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    expose:
+      - "3000"
+    networks:
+      private: {}
+      ingress:
+        aliases:
+          - forever-healing-public
+    mem_limit: 256m
+    cpus: 0.50
+    pids_limit: 128
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+networks:
+  private:
+    internal: true
+  ingress:
+    external: true
+    name: hosting-ingress-forever-healing
